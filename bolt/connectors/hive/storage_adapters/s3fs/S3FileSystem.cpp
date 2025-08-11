@@ -30,6 +30,7 @@
 
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include "bolt/common/base/StatsReporter.h"
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include "bolt/common/config/Config.h"
 #include "bolt/common/file/File.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3Config.h"
@@ -241,6 +242,12 @@ void registerCredentialsProvider(
   });
 }
 
+bool S3FileSystem::uploadPartAsyncEnabled = false;
+size_t S3FileSystem::kPartUploadSize = 10485760;
+size_t S3FileSystem::writeFileSemaphore = 4;
+std::shared_ptr<folly::CPUThreadPoolExecutor> S3FileSystem::uploadThreadPool_ =
+    nullptr;
+
 class S3FileSystem::Impl {
  public:
   Impl(const S3Config& s3Config) {
@@ -313,6 +320,18 @@ class S3FileSystem::Impl {
         inferPayloadSign(s3Config.payloadSigningPolicy());
 
     auto credentialsProvider = getCredentialsProvider(s3Config);
+
+    S3FileSystem::setUploadPartAsyncEnabled(s3Config.uploadPartAsync());
+    S3FileSystem::setPartUploadSize(
+    s3Config.partUploadSize().value_or(10485760));
+
+    S3FileSystem::setWriteFileSemaphoreNum(
+        s3Config.writeFileSemaphoreNum().value_or(4));
+
+    auto threadPoolSize =  s3Config.uploadThreads().value_or(16);
+    S3FileSystem::setUploadThreadPool(
+        std::make_shared<folly::CPUThreadPoolExecutor>(threadPoolSize));
+    LOG(INFO) << "partUploadSize : " << S3FileSystem::getPartUploadSize();
 
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
