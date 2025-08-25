@@ -323,15 +323,14 @@ class S3FileSystem::Impl {
 
     S3FileSystem::setUploadPartAsyncEnabled(s3Config.uploadPartAsync());
     S3FileSystem::setPartUploadSize(
-    s3Config.partUploadSize().value_or(10485760));
+        s3Config.partUploadSize().value_or(10485760));
 
     S3FileSystem::setWriteFileSemaphoreNum(
         s3Config.writeFileSemaphoreNum().value_or(4));
 
-    auto threadPoolSize =  s3Config.uploadThreads().value_or(16);
+    auto threadPoolSize = s3Config.uploadThreads().value_or(16);
     S3FileSystem::setUploadThreadPool(
         std::make_shared<folly::CPUThreadPoolExecutor>(threadPoolSize));
-    LOG(INFO) << "partUploadSize : " << S3FileSystem::getPartUploadSize();
 
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
