@@ -29,10 +29,11 @@
  */
 
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/synchronization/ThrottledLifoSem.h>
 #include "bolt/common/base/StatsReporter.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3Counters.h"
-#include "bolt/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3Util.h"
 #include "bolt/dwio/common/DataBuffer.h"
 
@@ -55,17 +56,28 @@ class S3WriteFile::Impl {
       std::string_view path,
       Aws::S3::S3Client* client,
       memory::MemoryPool* pool,
-      std::shared_ptr<S3UploadManager> uploadManager)
-      : client_(client), pool_(pool), uploadManager_(uploadManager) {
+      S3Config* s3Config)
+      : client_(client), pool_(pool) {
     BOLT_CHECK_NOT_NULL(client);
     BOLT_CHECK_NOT_NULL(pool);
-    BOLT_CHECK_NOT_NULL(uploadManager);
-    semaphore_ = std::make_unique<folly::ThrottledLifoSem>(
-        uploadManager_->getWriteFileSemaphoreNum());
+    BOLT_CHECK_NOT_NULL(s3Config);
+    partUploadSize_ = s3Config->partUploadSize().value_or(10485760);
+    if (s3Config->uploadPartAsync()) {
+      maxConcurrentUploadNum_ = std::make_unique<folly::ThrottledLifoSem>(
+          static_cast<uint32_t>(
+              s3Config->maxConcurrentUploadNum().value_or(4)));
+      if (!uploadThreadPool_) {
+        uploadThreadPool_ = std::make_shared<folly::CPUThreadPoolExecutor>(
+            s3Config->uploadThreads().value_or(16),
+            std::make_shared<folly::NamedThreadFactory>("upload-thread"));
+      }
+    } else {
+      uploadThreadPool_ = nullptr;
+    }
+
     getBucketAndKeyFromPath(path, bucket_, key_);
     currentPart_ = std::make_unique<dwio::common::DataBuffer<char>>(*pool_);
-    currentPart_->reserve(uploadManager_->getPartUploadSize());
-    // Check that the object doesn't exist, if it does throw an error.
+    currentPart_->reserve(partUploadSize_);
     {
       Aws::S3::Model::HeadObjectRequest request;
       request.SetBucket(awsString(bucket_));
@@ -84,7 +96,6 @@ class S3WriteFile::Impl {
           key_);
     }
 
-    // Create bucket if not present.
     {
       Aws::S3::Model::HeadBucketRequest request;
       request.SetBucket(awsString(bucket_));
@@ -98,17 +109,12 @@ class S3WriteFile::Impl {
       }
     }
 
-    // Initiate the multi-part upload.
     {
       Aws::S3::Model::CreateMultipartUploadRequest request;
       request.SetBucket(awsString(bucket_));
       request.SetKey(awsString(key_));
-
-      /// If we do not set anything then the SDK will default to application/xml
-      /// which confuses some tools
-      /// (https://github.com/apache/arrow/issues/11934). So we instead default
-      /// to application/octet-stream which is less misleading.
       request.SetContentType(kApplicationOctetStream);
+      request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32);
       auto outcome = client_->CreateMultipartUpload(request);
       BOLT_CHECK_AWS_OUTCOME(
           outcome, "Failed initiating multiple part upload", bucket_, key_);
@@ -118,49 +124,41 @@ class S3WriteFile::Impl {
     fileSize_ = 0;
   }
 
-  // Appends data to the end of the file.
   void append(std::string_view data) {
     BOLT_CHECK(!closed(), "File is closed");
-    if (data.size() + currentPart_->size() >=
-        uploadManager_->getPartUploadSize()) {
+    if (data.size() + currentPart_->size() >= partUploadSize_) {
       upload(data);
     } else {
-      // Append to current part.
       currentPart_->unsafeAppend(data.data(), data.size());
     }
     fileSize_ += data.size();
   }
 
-  // No-op.
   void flush() {
     BOLT_CHECK(!closed(), "File is closed");
-    /// currentPartSize must be less than kPartUploadSize since
-    /// append() would have already flushed after reaching kUploadPartSize.
-    BOLT_CHECK_LT(currentPart_->size(), uploadManager_->getPartUploadSize());
+    BOLT_CHECK_LT(currentPart_->size(), partUploadSize_);
   }
 
-  // Complete the multipart upload and close the file.
   void close() {
     if (closed()) {
       return;
     }
     RECORD_METRIC_VALUE(kMetricS3StartedUploads);
     uploadPart({currentPart_->data(), currentPart_->size()}, true);
-    if (uploadManager_->isUploadPartAsyncEnabled()) {
+    if (uploadThreadPool_) {
       if (!futures_.empty()) {
         folly::collectAll(std::move(futures_)).get();
-      }
       }
       std::sort(
           uploadState_.completedParts.begin(),
           uploadState_.completedParts.end(),
+          [](const Aws::S3::Model::CompletedPart& a,
              const Aws::S3::Model::CompletedPart& b) {
             return a.GetPartNumber() < b.GetPartNumber();
           });
     }
 
     BOLT_CHECK_EQ(uploadState_.partNumber, uploadState_.completedParts.size());
-    // Complete the multipart upload.
     {
       Aws::S3::Model::CompletedMultipartUpload completedUpload;
       completedUpload.SetParts(uploadState_.completedParts);
@@ -182,7 +180,6 @@ class S3WriteFile::Impl {
     currentPart_->clear();
   }
 
-  // Current file size, i.e. the sum of all previous appends.
   uint64_t size() const {
     return fileSize_;
   }
@@ -199,122 +196,84 @@ class S3WriteFile::Impl {
     return (currentPart_->capacity() == 0);
   }
 
-  // Holds state for the multipart upload.
   struct UploadState {
     Aws::Vector<Aws::S3::Model::CompletedPart> completedParts;
     int64_t partNumber = 0;
     Aws::String id;
   };
 
-  // Data can be smaller or larger than the kPartUploadSize.
-  // Complete the currentPart_ and upload kPartUploadSize chunks of data.
-  // Save the remaining into currentPart_.
   void upload(const std::string_view data) {
     auto dataPtr = data.data();
     auto dataSize = data.size();
-    // Fill-up the remaining currentPart_.
     auto remainingBufferSize = currentPart_->capacity() - currentPart_->size();
     currentPart_->unsafeAppend(dataPtr, remainingBufferSize);
     uploadPart({currentPart_->data(), currentPart_->size()});
     dataPtr += remainingBufferSize;
     dataSize -= remainingBufferSize;
-    while (dataSize > uploadManager_->getPartUploadSize()) {
-      uploadPart({dataPtr, uploadManager_->getPartUploadSize()});
-      dataPtr += uploadManager_->getPartUploadSize();
-      dataSize -= uploadManager_->getPartUploadSize();
+    while (dataSize > partUploadSize_) {
+      uploadPart({dataPtr, partUploadSize_});
+      dataPtr += partUploadSize_;
+      dataSize -= partUploadSize_;
     }
-    // Stash the remaining at the beginning of currentPart.
     currentPart_->unsafeAppend(0, dataPtr, dataSize);
   }
 
   void uploadPart(const std::string_view part, bool isLast = false) {
-    if (uploadManager_->isUploadPartAsyncEnabled()) {
-      // If this is the last part and no parts have been uploaded yet,
-      // use the synchronous upload method.
-      if (isLast && uploadState_.partNumber == 0) {
-        uploadPartV1(part, isLast);
-      } else {
-        uploadPartAsync(part, isLast);
-      }
+    BOLT_CHECK(isLast || (!isLast && (part.size() == partUploadSize_)));
+    auto uploadPartSync = [&](const std::string_view partData) {
+      Aws::S3::Model::CompletedPart completedPart =
+          uploadPartSeq(uploadState_.id, ++uploadState_.partNumber, partData);
+      uploadState_.completedParts.push_back(std::move(completedPart));
+    };
+    bool useSyncUpload =
+        !uploadThreadPool_ || (isLast && uploadState_.partNumber == 0);
+    if (useSyncUpload) {
+      uploadPartSync(part);
     } else {
-      uploadPartV1(part, isLast);
+      uploadPartAsync(part);
     }
   }
 
-  // Upload the part synchronously.
-  void uploadPartV1(const std::string_view part, bool isLast = false) {
-    // Only the last part can be less than kPartUploadSize.
-    BOLT_CHECK(
-        isLast ||
-        (!isLast && (part.size() == uploadManager_->getPartUploadSize())));
-    // Upload the part.
-    {
-      Aws::S3::Model::UploadPartRequest request;
-      request.SetBucket(bucket_);
-      request.SetKey(key_);
-      request.SetUploadId(uploadState_.id);
-      request.SetPartNumber(++uploadState_.partNumber);
-      request.SetContentLength(part.size());
-      request.SetBody(
-          std::make_shared<StringViewStream>(part.data(), part.size()));
-      auto outcome = client_->UploadPart(request);
-      BOLT_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
-      // Append ETag and part number for this uploaded part.
-      // This will be needed for upload completion in Close().
-      auto result = outcome.GetResult();
-      Aws::S3::Model::CompletedPart part;
-
-      part.SetPartNumber(uploadState_.partNumber);
-      part.SetETag(result.GetETag());
-      // Don't add the checksum to the part if the checksum is empty.
-      // Some filesystems such as IBM COS require this to be not set.
-      if (!result.GetChecksumCRC32().empty()) {
-        part.SetChecksumCRC32(result.GetChecksumCRC32());
-      }
-      uploadState_.completedParts.push_back(std::move(part));
+  Aws::S3::Model::CompletedPart uploadPartSeq(
+      const Aws::String& uploadId,
+      const int64_t partNumber,
+      const std::string_view part) {
+    Aws::S3::Model::UploadPartRequest request;
+    request.SetBucket(bucket_);
+    request.SetKey(key_);
+    request.SetUploadId(uploadId);
+    request.SetPartNumber(partNumber);
+    request.SetContentLength(part.size());
+    request.SetBody(
+        std::make_shared<StringViewStream>(part.data(), part.size()));
+    request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32);
+    auto outcome = client_->UploadPart(request);
+    BOLT_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
+    auto result = outcome.GetResult();
+    Aws::S3::Model::CompletedPart completedPart;
+    completedPart.SetPartNumber(partNumber);
+    completedPart.SetETag(result.GetETag());
+    if (!result.GetChecksumCRC32().empty()) {
+      completedPart.SetChecksumCRC32(result.GetChecksumCRC32());
     }
+    return completedPart;
   }
 
-  // Upload the part asynchronously.
-  void uploadPartAsync(const std::string_view part, const bool isLast = false) {
-    BOLT_CHECK(
-        isLast ||
-        (!isLast && (part.size() == uploadManager_->getPartUploadSize())));
-    semaphore_->wait();
+  void uploadPartAsync(const std::string_view part) {
+    maxConcurrentUploadNum_->wait();
     const int64_t partNumber = ++uploadState_.partNumber;
-    auto const partLength = part.size();
     std::shared_ptr<std::string> partStr =
         std::make_shared<std::string>(part.data(), part.size());
-    futures_.emplace_back(folly::via(
-        uploadManager_->getUploadThreadPool().get(),
-        [this, partNumber, partStr, partLength]() {
+    futures_.emplace_back(
+        folly::via(uploadThreadPool_.get(), [this, partNumber, partStr]() {
           SCOPE_EXIT {
-            semaphore_->post();
+            maxConcurrentUploadNum_->post();
           };
           try {
-            Aws::S3::Model::UploadPartRequest request;
-            request.SetBucket(bucket_);
-            request.SetKey(key_);
-            request.SetUploadId(uploadState_.id);
-            request.SetPartNumber(partNumber);
-            request.SetContentLength(partLength);
-
-            request.SetBody(std::make_shared<StringViewStream>(
-                partStr->c_str(), partLength));
-
-            auto outcome = client_->UploadPart(request);
-            BOLT_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
-
-            auto result = outcome.GetResult();
-            Aws::S3::Model::CompletedPart completedPart;
-            completedPart.SetPartNumber(partNumber);
-            completedPart.SetETag(result.GetETag());
-
-            // Use a mutex to ensure thread safety for completedParts update
-            {
-              std::lock_guard<std::mutex> lock(uploadStateMutex_);
-              uploadState_.completedParts.push_back(std::move(completedPart));
-            }
+            Aws::S3::Model::CompletedPart completedPart =
+                uploadPartSeq(uploadState_.id, partNumber, *partStr);
+            std::lock_guard<std::mutex> lock(uploadStateMutex_);
+            uploadState_.completedParts.push_back(std::move(completedPart));
           } catch (const std::exception& e) {
             LOG(ERROR) << "Exception during async upload: " << e.what();
           } catch (...) {
@@ -332,16 +291,17 @@ class S3WriteFile::Impl {
   UploadState uploadState_;
   std::mutex uploadStateMutex_;
   std::vector<folly::Future<folly::Unit>> futures_;
-  std::unique_ptr<folly::ThrottledLifoSem> semaphore_;
-  std::shared_ptr<S3UploadManager> uploadManager_;
+  size_t partUploadSize_;
+  std::unique_ptr<folly::ThrottledLifoSem> maxConcurrentUploadNum_;
+  inline static std::shared_ptr<folly::CPUThreadPoolExecutor> uploadThreadPool_;
 };
 
 S3WriteFile::S3WriteFile(
     std::string_view path,
     Aws::S3::S3Client* client,
     memory::MemoryPool* pool,
-    std::shared_ptr<S3UploadManager> uploadManager) {
-  impl_ = std::make_shared<Impl>(path, client, pool, uploadManager);
+    S3Config* s3Config) {
+  impl_ = std::make_shared<Impl>(path, client, pool, s3Config);
 }
 
 void S3WriteFile::append(std::string_view data) {

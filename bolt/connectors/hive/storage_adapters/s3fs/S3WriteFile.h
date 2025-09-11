@@ -32,7 +32,7 @@
 
 #include "bolt/common/file/File.h"
 #include "bolt/common/memory/MemoryPool.h"
-#include "bolt/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
+#include "bolt/connectors/hive/storage_adapters/s3fs/S3Config.h"
 
 namespace Aws::S3 {
 class S3Client;
@@ -66,7 +66,7 @@ class S3WriteFile : public WriteFile {
       std::string_view path,
       Aws::S3::S3Client* client,
       memory::MemoryPool* pool,
-      std::shared_ptr<S3UploadManager> uploadManager);
+      S3Config* s3Config);
 
   /// Appends data to the end of the file.
   /// Uploads a part on reaching part size limit.
@@ -83,7 +83,6 @@ class S3WriteFile : public WriteFile {
 
   /// Return the number of parts uploaded so far.
   int numPartsUploaded() const;
-
  protected:
   class Impl;
   std::shared_ptr<Impl> impl_;

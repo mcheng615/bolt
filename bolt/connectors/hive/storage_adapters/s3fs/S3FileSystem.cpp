@@ -30,7 +30,6 @@
 
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include "bolt/common/base/StatsReporter.h"
-#include <folly/executors/CPUThreadPoolExecutor.h>
 #include "bolt/common/config/Config.h"
 #include "bolt/common/file/File.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/S3Config.h"
@@ -299,15 +298,6 @@ void S3UploadManager::setUploadThreadPool(size_t value) {
   uploadThreadPool_ = threadPool;
 }
 
-size_t S3UploadManager::validatePositiveValue(
-    size_t value,
-    const std::string& name) {
-  BOLT_USER_CHECK(
-      value > 0,
-      fmt::format("Invalid configuration: '{}' must be greater than 0.", name));
-  return value;
-}
-
 class S3FileSystem::Impl {
  public:
   Impl(const S3Config& s3Config) {
@@ -381,9 +371,9 @@ class S3FileSystem::Impl {
 
     auto credentialsProvider = getCredentialsProvider(s3Config);
 
-    uploadManager_ = S3UploadManager::getInstance(s3Config);
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
+    s3Config_ = std::make_shared<S3Config>(s3Config);
     ++fileSystemCount;
   }
 
@@ -521,8 +511,8 @@ class S3FileSystem::Impl {
     return client_.get();
   }
 
-  std::shared_ptr<S3UploadManager> s3UploadManager() const {
-    return uploadManager_;
+  S3Config* s3Config() const {
+    return s3Config_.get();
   }
 
   std::string getLogLevelName() const {
@@ -535,7 +525,7 @@ class S3FileSystem::Impl {
 
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
-  std::shared_ptr<S3UploadManager> uploadManager_;
+  std::shared_ptr<S3Config> s3Config_;
 };
 
 S3FileSystem::S3FileSystem(
@@ -568,7 +558,7 @@ std::unique_ptr<WriteFile> S3FileSystem::openFileForWrite(
     const FileOptions& options) {
   const auto path = getPath(s3Path);
   auto s3file = std::make_unique<S3WriteFile>(
-      path, impl_->s3Client(), options.pool, impl_->s3UploadManager());
+      path, impl_->s3Client(), options.pool, impl_->s3Config());
   return s3file;
 }
 
@@ -610,7 +600,9 @@ bool S3FileSystem::exists(std::string_view path) {
   return impl_->s3Client()->HeadObject(request).IsSuccess();
 }
 
-void S3FileSystem::mkdir(std::string_view path) {
+void S3FileSystem::mkdir(
+    std::string_view path,
+    const DirectoryOptions& /*options*/) {
   std::string bucket;
   std::string key;
   getBucketAndKeyFromPath(getPath(path), bucket, key);
