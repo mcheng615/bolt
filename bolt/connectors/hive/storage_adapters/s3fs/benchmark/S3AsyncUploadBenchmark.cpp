@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <folly/Benchmark.h>
 #include <folly/init/Init.h>
 
@@ -37,10 +53,7 @@ class S3AsyncUploadBenchmark {
     minioServer_->addBucket(bucket);
   }
 
-  void run(
-      const std::string& name,
-      bool enableUploadPartAsync,
-      int32_t sizeMiB) {
+  void run(const std::string& name, bool enableUploadPartAsync, int32_t sizeMiB) {
     folly::BenchmarkSuspender suspender;
     const auto bucketName = "writedata";
     const auto file = fmt::format("test_{}_{}.txt", name, sizeMiB);
@@ -48,9 +61,10 @@ class S3AsyncUploadBenchmark {
     addBucket(bucketName);
     const auto s3File = s3URI(bucketName, file.c_str());
     auto hiveConfig = minioServer_->hiveConfig(
-        {{"hive.s3.upload-part-async",
+        {{"hive.s3.part-upload-async",
           enableUploadPartAsync ? "true" : "false"}});
     filesystems::S3FileSystem s3fs(bucketName, hiveConfig);
+
     suspender.dismiss();
     auto pool = memory::memoryManager()->addLeafPool("S3AsyncUploadBenchmark");
     auto writeFile =
@@ -101,7 +115,7 @@ DEFINE_BENCHMARKS(2048)
 } // namespace
 
 int main(int argc, char** argv) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
   bytedance::bolt::memory::MemoryManager::initialize(
       bytedance::bolt::memory::MemoryManager::Options{});
   folly::runBenchmarks();

@@ -25,11 +25,11 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_executable(bolt_s3FileSystem_benchmark S3FileSystemBenchmark.cpp)
+add_executable(bolt_s3asyncupload_benchmark S3AsyncUploadBenchmark.cpp)
 
-add_test(bolt_s3FileSystem_benchmark bolt_s3FileSystem_benchmark)
+add_test(bolt_s3asyncupload_benchmark bolt_s3asyncupload_benchmark)
 target_link_libraries(
-  bolt_s3FileSystem_benchmark
+  bolt_s3asyncupload_benchmark
   bolt_s3fs
   bolt_testutils
   GTest::gtest
